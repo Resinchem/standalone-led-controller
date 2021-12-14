@@ -2,8 +2,8 @@
  * Standalone LED Controller with Motion Detection
  * Includes captive portal and OTA Updates
  * This provides standalone motion-activated control for WS2812b LED strips
- * Version: 0.30
- * Last Updated: 12/12/2021
+ * Version: 0.40
+ * Last Updated: 12/14/2021
  * ResinChem Tech
  */
 #include <FS.h>                   
@@ -16,11 +16,12 @@
 #include <FastLED.h>
 #include <ArduinoJson.h>          //https://github.com/bblanchon/ArduinoJson
 #include <WiFiClient.h>
+#include <ESP8266HTTPUpdateServer.h>
 
 #ifdef ESP32
   #include <SPIFFS.h>
 #endif
-
+#define VERSION "v0.40 (ESP8266)"
 
 // ================================
 //  User Defined values and options
@@ -61,6 +62,7 @@ bool shouldSaveConfig = false;
 
 WiFiClient espClient;
 ESP8266WebServer server;
+ESP8266HTTPUpdateServer httpUpdater;
 WiFiManager wifiManager;
 CRGB LEDs[NUM_LEDS_MAX];           
 
@@ -81,8 +83,9 @@ String postForms = "<html>\
   </head>\
   <body>\
     <h1>LED Controller Settings</h1><br>\
-    The default boot values are listed.  Changes made here will be used <b><i>until the controller is restarted</i></b>. If the controller is restarted, the default boot values will be reloaded.<br><br>\
-    If you wish to permanently change the boot values or change WiFi settings, you must issue the /reset command and complete the initial setup steps again.<br><br>\
+    The default boot values are listed below.  Changes made here will be used <b><i>until the controller is restarted</i></b>, unless the box to save the settings as new boot defaults is checked.<br><br>\
+    To test settingss, leave the box unchecked (this page will always show the <i>boot values</i> when reloaded and not the current running values if they are different).<br><br>\
+    If you need to change wifi settings, you must use the 'Reset All' command.<br><br>\
     <form method=\"post\" enctype=\"application/x-www-form-urlencoded\" action=\"/postform/\">\
       <table>\
       <tr>\
@@ -117,12 +120,21 @@ String postForms = "<html>\
       <td><input type=\"number\" min=\"0\" max=\"255\" name=\"blue\" value=\"VAR_CURRENT_BLUE\"></td>\
       </tr>\
       </table><br>\
+      <input type=\"checkbox\" name=\"chksave\" value=\"save\">Save all settings as new boot defaults (controller will reboot)<br><br>\
       <input type=\"submit\" value=\"Update\">\
     </form>\
     <br>\
     <h2>Controller Commands</h2>\
-    <button id=\"btnrestart\" onclick=\"location.href = './restart';\">Restart</button> - This will reboot controller and reload default boot values.<br><br>\
-    <button id=\"btnreset\" onclick=\"location.href = './reset';\">RESET!</button> - <b>WARNING</b>: This will clear all settings, including WiFi!<br>\
+    Caution: Restart and Reset are executed immediately when the button is clicked.<br>\
+    <table border=\"1\" cellpadding=\"10\">\
+    <tr>\
+    <td><button id=\"btnrestart\" onclick=\"location.href = './restart';\">Restart</button></td><td>This will reboot controller and reload default boot values.</td>\
+    </tr><tr>\
+    <td><button id=\"btnreset\" style=\"background-color:#FAADB7\" onclick=\"location.href = './reset';\">RESET ALL</button></td><td><b>WARNING</b>: This will clear all settings, including WiFi! You must complete initial setup again.</td>\
+    </tr><tr>\
+    <td><button id=\"btnupdate\" onclick=\"location.href = './update';\">Firmware Upgrade</button></td><td>Upload and apply new firmware from local file.</td>\
+    </tr></table><br>\
+    Current version: VAR_CURRRENT_VER\
   </body>\
 </html>";
 
@@ -151,6 +163,7 @@ void handleRoot() {
   postForms.replace("VAR_CURRENT_RED", String(ledRed)); 
   postForms.replace("VAR_CURRENT_GREEN", String(ledGreen));
   postForms.replace("VAR_CURRENT_BLUE", String(ledBlue));
+  postForms.replace("VAR_CURRRENT_VER", VERSION);
   server.send(200, "text/html", postForms);
 }
 
@@ -158,6 +171,7 @@ void handleForm() {
   if (server.method() != HTTP_POST) {
     server.send(405, "text/plain", "Method Not Allowed");
   } else {
+    String saveSettings;
     numPIRs = server.arg("pirs").toInt();
     numLEDs = server.arg("leds").toInt();
     ledBrightness = server.arg("brightness").toInt();
@@ -165,6 +179,7 @@ void handleForm() {
     ledRed = server.arg("red").toInt();
     ledGreen = server.arg("green").toInt();
     ledBlue = server.arg("blue").toInt();
+    saveSettings = server.arg("chksave");
     String message = "<html>\
       </head>\
         <title>LED Controller Settings</title>\
@@ -183,12 +198,22 @@ void handleForm() {
     message += "Red: " + server.arg("red") + "<br>";  
     message += "Green: " + server.arg("green") + "<br>";  
     message += "Blue: " + server.arg("blue") + "<br>";  
-    updateSettings();
+    if (saveSettings == "save") {
+      message += "<br>";
+      message += "<b>New settings saved as boot defaults.</b> Controller will now reboot.<br>";
+      message += "You can return to the settings page after boot completes (lights will briefly turn blue to indicate completed boot).<br>";    
+    } 
     message += "<br><a href=\"http://";
     message += baseIP;
     message += "\">Return to settings</a><br>";
     message += "</body></html>";
     server.send(200, "text/html", message);
+    delay(1000);
+    if (saveSettings == "save") {
+      updateSettings(true);
+    } else {
+      updateSettings(false);
+    } 
   }
 }
 
@@ -204,15 +229,110 @@ void handleNotFound() {
   server.send(404, "text/plain", message);
 }
 
-void updateSettings() {
+void handleUpdate() {
+  String updFirmware = "<html>\
+      </head>\
+        <title>LED Controller Settings</title>\
+        <style>\
+          body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }\
+        </style>\
+      </head>\
+      <body>\
+      <H1>Firmware Update</H1>\
+      <H3>Current firmware version: ";
+  updFirmware += VERSION;
+  updFirmware += "</H3><br>";
+  updFirmware += "Notes:<br>";
+  updFirmware += "<ul>";
+  updFirmware += "<li>The firmware update will begin as soon as the Update Firmware button is clicked.</li><br>";
+  updFirmware += "<li>Your current settings will be retained.</li><br>";
+  updFirmware += "<li><b>Please be patient!</b> The update will take a few minutes.  Do not refresh the page or navigate away.</li><br>";
+  updFirmware += "<li>If the upload is successful, a brief message will appear and the controller will reboot.</li><br>";
+  updFirmware += "<li>After rebooting, you'll automatically be taken back to the main settings page and the update will be complete.</li><br>";
+  updFirmware += "</ul><br>";
+  updFirmware += "</body></html>";    
+  updFirmware += "<form method='POST' action='/update2' enctype='multipart/form-data'>";
+  updFirmware += "<input type='file' accept='.bin,.bin.gz' name='Select file' style='width: 300px'><br><br>";
+  updFirmware += "<input type='submit' value='Update Firmware'>";
+  updFirmware += "</form><br>";
+  updFirmware += "<br><a href=\"http://";
+  updFirmware += baseIP;
+  updFirmware += "\">Return to settings</a><br>";
+  updFirmware += "</body></html>";
+  server.send(200, "text/html", updFirmware); 
+}
+
+void updateSettings(bool saveBoot) {
   // This updates the current local settings for current session only.  
   // Will be overwritten with reboot/reset/OTAUpdate
+  if (saveBoot) {
+    updateBootSettings();
+  }
+  //Update FastLED with new brightness and ON color settings
   FastLED.setBrightness(ledBrightness);
   ledColorOn = CRGB(ledRed, ledGreen, ledBlue);
   toggleLights(true);
   delay(2000);
   toggleLights(false);
+}
+
+void updateBootSettings() {
+  char t_pir_count[3];
+  char t_led_count[5];
+  char t_led_on_time[4];
+  char t_led_brightness[4];
+  char t_led_red[4];
+  char t_led_green[4];
+  char t_led_blue[4];
+  #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+    Serial.println("Attempting to update boot settings");
+  #endif
+
+  //Convert values into char arrays
+  sprintf(t_pir_count, "%u", numPIRs);
+  sprintf(t_led_count, "%u", numLEDs);
+  sprintf(t_led_on_time, "%u", ledOnTime);
+  sprintf(t_led_brightness, "%u", ledBrightness);
+  sprintf(t_led_red, "%u", ledRed);
+  sprintf(t_led_green, "%u", ledGreen);
+  sprintf(t_led_blue, "%u", ledBlue);
+
+#ifdef ARDUINOJSON_VERSION_MAJOR >= 6
+    DynamicJsonDocument json(1024);
+#else
+    DynamicJsonBuffer jsonBuffer;
+    JsonObject& json = jsonBuffer.createObject();
+#endif
+
+    json["pir_count"] = t_pir_count;
+    json["led_count"] = t_led_count;
+    json["led_on_time"] = t_led_on_time;
+    json["led_brightness"] = t_led_brightness;
+    json["led_red"] = t_led_red;
+    json["led_green"] = t_led_green;
+    json["led_blue"] = t_led_blue;
+
+  File configFile = SPIFFS.open("/config.json", "w");
+  if (!configFile) {
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+      Serial.println("failed to open config file for writing");
+    #endif
+  }
+
+#ifdef ARDUINOJSON_VERSION_MAJOR >= 6
+    serializeJson(json, Serial);
+    serializeJson(json, configFile);
+#else
+    json.printTo(Serial);
+    json.printTo(configFile);
+#endif
+    configFile.close();
+    //end save
+  #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+    Serial.println("Boot settings saved. Rebooting controller.");
+  #endif
   
+  ESP.restart();
 }
 // ==================================
 //  Main Setup
@@ -458,6 +578,9 @@ void setup() {
 
   server.onNotFound(handleNotFound);
 
+  server.on("/update", handleUpdate);
+  httpUpdater.setup(&server, "/update2");
+
   server.on("/restart",[](){
     String restartMsg = "<HTML>\
       </head>\
@@ -469,7 +592,7 @@ void setup() {
       <body>\
       <H1>Controller restarting...</H1><br>\
       <H3>Please wait</H3><br>\
-      After the controller completes the boot process, you may click the following link to return to the main page:<br><br>\
+      After the controller completes the boot process (lights will flash blue for approx. 2 seconds), you may click the following link to return to the main page:<br><br>\
       <a href=\"http://";      
     restartMsg += baseIP;
     restartMsg += "\">Return to settings</a><br>";
@@ -510,6 +633,7 @@ void setup() {
     ota_time = ota_time_window;
     ota_time_elapsed = 0;
   });
+  httpUpdater.setup(&server);
   server.begin();
   #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
     Serial.println("Setup complete - starting main loop");
