@@ -2,9 +2,13 @@
  * Standalone LED Controller with Motion Detection
  * Includes captive portal and OTA Updates
  * This provides standalone motion-activated control for WS2812b LED strips
- * Version: 0.40
+ * Version: 0.45
  * Last Updated: 12/14/2021
  * ResinChem Tech
+ * 0.45 notes
+ *   - Add separate colors for each motion detector
+ *   - Add a few basic effects
+ *   - General code cleanup and documentation
  */
 #include <FS.h>                   
 #include <WiFiManager.h>          //https://github.com/tzapu/WiFiManager
@@ -21,7 +25,7 @@
 #ifdef ESP32
   #include <SPIFFS.h>
 #endif
-#define VERSION "v0.40 (ESP8266)"
+#define VERSION "v0.45 (ESP8266)"
 
 // ================================
 //  User Defined values and options
@@ -35,8 +39,21 @@ uint16_t ota_time_window = 20000;        // time to start file upload when ota_f
 #define MOTION_PIN_1 D5
 #define MOTION_PIN_2 D6
 #define NUM_LEDS_MAX 600
-#define SERIAL_DEBUG 0                   // Enable(1) or disable (0) serial montior output - disable for compiled .bin
+#define SERIAL_DEBUG 1                   // Enable(1) or disable (0) serial montior output - disable for compiled .bin
 // ================================
+
+// ===============================
+//  Effects array 
+// ===============================
+//  Effects are defined in defineEffects() - called in Setup
+//  Effects must be handled in the lights on call
+//  To add an effect:
+//    - Increase array below (if adding)
+//    - Add element and add name in defineEffects()
+//    - Update case statement in toggleLights()
+//    - Add function to implement effect (called by toggleLights)
+int numberOfEffects = 5;
+String Effects[5]; 
 
 uint16_t ota_time_elapsed = 0;           // Counter when OTA active
 bool ota_flag = true;
@@ -50,14 +67,13 @@ char led_brightness[4];
 char led_red[4];
 char led_green[4];
 char led_blue[4];
+char led_red_m2[4];
+char led_green_m2[4];
+char led_blue_m2[4];
+char led_effect[16];
+char led_effect_m2[16];
 
 String baseIP;
-
-//==================================
-// CAPTIVE PORTAL SETUP
-//==================================
-//flag for saving data
-bool shouldSaveConfig = false;
 
 
 WiFiClient espClient;
@@ -66,6 +82,9 @@ ESP8266HTTPUpdateServer httpUpdater;
 WiFiManager wifiManager;
 CRGB LEDs[NUM_LEDS_MAX];           
 
+//---- Captive Portal -------
+//flag for saving data in captive portal
+bool shouldSaveConfig = false;
 //callback notifying us of the need to save config
 void saveConfigCallback () {
   #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1) 
@@ -73,8 +92,35 @@ void saveConfigCallback () {
   #endif
   shouldSaveConfig = true;
 }
+//---------------------------
 
-String postForms = "<html>\
+//==========================
+// LED Setup
+//==========================
+// defaults - will be set/overwritten by portal or last vals on reboot
+byte numPIRs = 2;
+int numLEDs = 30;        
+int ledOnTime = 15;
+byte ledBrightness = 128;
+byte ledRed_m1 = 255;
+byte ledGreen_m1 = 255;
+byte ledBlue_m1 = 255;
+byte ledRed_m2 = 255;
+byte ledGreen_m2 = 255;
+byte ledBlue_m2 = 255;
+String ledEffect_m1 = "Solid";
+String ledEffect_m2 = "Solid";
+CRGB ledColorOn_m1 = CRGB::White;
+CRGB ledColorOn_m2 = CRGB::White;
+CRGB ledColorOff = CRGB::Black;
+
+//===============================
+// Web pages and handlers
+//===============================
+// Main Settings page
+// Root / Main Settings page handler
+void handleRoot() {
+  String mainPage = "<html>\
   <head>\
     <title>LED Controller</title>\
     <style>\
@@ -83,42 +129,86 @@ String postForms = "<html>\
   </head>\
   <body>\
     <h1>LED Controller Settings</h1><br>\
-    The default boot values are listed below.  Changes made here will be used <b><i>until the controller is restarted</i></b>, unless the box to save the settings as new boot defaults is checked.<br><br>\
-    To test settingss, leave the box unchecked (this page will always show the <i>boot values</i> when reloaded and not the current running values if they are different).<br><br>\
+    Changes made here will be used <b><i>until the controller is restarted</i></b>, unless the box to save the settings as new boot defaults is checked.<br><br>\
+    To test settings, leave the box unchecked and click 'Update'. Once you have settings you'd like to keep, check the box and click 'Update' to write the settings as the new boot defaults.<br><br>\
     If you need to change wifi settings, you must use the 'Reset All' command.<br><br>\
     <form method=\"post\" enctype=\"application/x-www-form-urlencoded\" action=\"/postform/\">\
       <table>\
       <tr>\
       <td><label for=\"pirs\">Number of Motion PIRs (1-2):</label></td>\
-      <td><input type=\"number\" min=\"1\" max=\"2\" name=\"pirs\" value=\"VAR_CURRENT_PIRS\"></td>\
-      </tr>\
+      <td><input type=\"number\" min=\"1\" max=\"2\" name=\"pirs\" value=\"";
+   
+  mainPage += String(numPIRs);
+  mainPage += "\"></td></tr>\
       <tr>\
       <td><label for=\"leds\">Number of Pixels (1-600):</label></td>\
-      <td><input type=\"number\" min=\"1\" max=\"600\" name=\"leds\" value=\"VAR_CURRENT_LEDS\"></td>\
-      </tr>\
+      <td><input type=\"number\" min=\"1\" max=\"600\" name=\"leds\" value=\"";
+  mainPage += String(numLEDs);    
+  mainPage += "\"></td></tr>\
       <tr>\
       <td><label for=\"brightness\">LED Brightness (0-255):</label></td>\
-      <td><input type=\"number\" min=\"0\" max=\"255\" name=\"brightness\" value=\"VAR_CURRENT_BRI\"></td>\
+      <td><input type=\"number\" min=\"0\" max=\"255\" name=\"brightness\" value=\"";
+  mainPage += String(ledBrightness);
+  mainPage += "\"></td>\
       </tr>\
       <tr>\
-      <td><label for=\"brightness\">LED On Time (seconds):</label></td>\
-      <td><input type=\"number\" min=\"0\" max=\"999\" name=\"ontime\" value=\"VAR_CURRENT_TIME\"></td>\
+      <td><label for=\"ledtime\">LED On Time (seconds):</label></td>\
+      <td><input type=\"number\" min=\"0\" max=\"999\" name=\"ontime\" value=\"";
+  mainPage += String(ledOnTime);
+  mainPage += "\"></td>\
       </tr>\
       </table><br>\
-      <b><u>LED Color</b></u>:\
+      <b><u>LED Colors and Effects</b></u>:<br>\
+      If two motion detectors are defined, each may have its own color and effect.  When a motion detector is activated, it will apply its own color and effect.<br>\
+      For effects that use two colors (e.g. 2-Segment), the other motion detector's color setting will be used as the secondary color.<br><br>\
       <table>\
       <tr>\
+      <td>&nbsp;</td><td><b><u>Motion 1</b></u></td><td><b><u>Motion 2</b></u></td>\
+      <tr>\
       <td><label for=\"red\">Red (0-255):</label></td>\
-      <td><input type=\"number\" min=\"0\" max=\"255\" name=\"red\"  value=\"VAR_CURRENT_RED\"></td>\
+      <td><input type=\"number\" min=\"0\" max=\"255\" name=\"red1\"  value=\"";
+  mainPage += String(ledRed_m1);
+  mainPage += "\"></td><td><input type=\"number\" min=\"0\" max=\"255\" name=\"red2\"  value=\"";
+  mainPage += String(ledRed_m2);
+  mainPage += "\"></td>\
       </tr>\
       <tr>\
       <td><label for=\"green\">Green (0-255):</label></td>\
-      <td><input type=\"number\" min=\"0\" max=\"255\" name=\"green\" value=\"VAR_CURRENT_GREEN\"></td>\
+      <td><input type=\"number\" min=\"0\" max=\"255\" name=\"green1\" value=\"";
+  mainPage += String(ledGreen_m1);
+  mainPage += "\"></td><td><input type=\"number\" min=\"0\" max=\"255\" name=\"green2\" value=\"";
+  mainPage += String(ledGreen_m2);
+  mainPage += "\"></td>\
       </tr>\
       <tr>\
       <td><label for=\"blue\">Blue (0-255):</label></td>\
-      <td><input type=\"number\" min=\"0\" max=\"255\" name=\"blue\" value=\"VAR_CURRENT_BLUE\"></td>\
+      <td><input type=\"number\" min=\"0\" max=\"255\" name=\"blue1\" value=\"";
+  mainPage += String(ledBlue_m1);
+  mainPage += "\"></td><td><input type=\"number\" min=\"0\" max=\"255\" name=\"blue2\" value=\"";
+  mainPage += String(ledBlue_m2);
+  mainPage += "\"></td>\
       </tr>\
+      <tr>\
+      <td><label for=\"effect\">Effect:</label></td>\
+      <td><select name=\"effect1\">";
+ // Dropdown Effects boxes
+ for (byte i = 0; i < numberOfEffects; i++) {
+   mainPage += "<option value=\"" + Effects[i] + "\"";
+   if (Effects[i] == ledEffect_m1) {
+     mainPage += " selected";
+   }
+   mainPage += ">" + Effects[i] + "</option>";
+ }
+ mainPage += "</select></td><td><select name=\"effect2\">";
+ for (byte i = 0; i < numberOfEffects; i++) {
+   mainPage += "<option value=\"" + Effects[i] + "\"";
+   if (Effects[i] == ledEffect_m2) {
+     mainPage += " selected";
+   }
+   mainPage += ">" + Effects[i] + "</option>";
+ }
+
+ mainPage += "</td></tr>\
       </table><br>\
       <input type=\"checkbox\" name=\"chksave\" value=\"save\">Save all settings as new boot defaults (controller will reboot)<br><br>\
       <input type=\"submit\" value=\"Update\">\
@@ -137,36 +227,11 @@ String postForms = "<html>\
     Current version: VAR_CURRRENT_VER\
   </body>\
 </html>";
-
-//==========================
-// LED Setup
-//==========================
-// defaults - will be set/overwritten by portal or last vals on reboot
-byte numPIRs = 2;
-int numLEDs = 30;        
-int ledOnTime = 15;
-byte ledBrightness = 128;
-byte ledRed = 255;
-byte ledGreen = 255;
-byte ledBlue = 255;
-CRGB ledColorOn = CRGB::White;
-CRGB ledColorOff = CRGB::Black;
-
-//==================================
-// Web Server Handlers
-//==================================
-void handleRoot() {
-  postForms.replace("VAR_CURRENT_PIRS", String(numPIRs));   
-  postForms.replace("VAR_CURRENT_LEDS", String(numLEDs));  
-  postForms.replace("VAR_CURRENT_BRI", String(ledBrightness)); 
-  postForms.replace("VAR_CURRENT_TIME", String(ledOnTime)); 
-  postForms.replace("VAR_CURRENT_RED", String(ledRed)); 
-  postForms.replace("VAR_CURRENT_GREEN", String(ledGreen));
-  postForms.replace("VAR_CURRENT_BLUE", String(ledBlue));
-  postForms.replace("VAR_CURRRENT_VER", VERSION);
-  server.send(200, "text/html", postForms);
+  mainPage.replace("VAR_CURRRENT_VER", VERSION);
+  server.send(200, "text/html", mainPage);
 }
 
+// Settings submit handler - Settings results
 void handleForm() {
   if (server.method() != HTTP_POST) {
     server.send(405, "text/plain", "Method Not Allowed");
@@ -176,9 +241,14 @@ void handleForm() {
     numLEDs = server.arg("leds").toInt();
     ledBrightness = server.arg("brightness").toInt();
     ledOnTime = server.arg("ontime").toInt();
-    ledRed = server.arg("red").toInt();
-    ledGreen = server.arg("green").toInt();
-    ledBlue = server.arg("blue").toInt();
+    ledRed_m1 = server.arg("red1").toInt();
+    ledGreen_m1 = server.arg("green1").toInt();
+    ledBlue_m1 = server.arg("blue1").toInt();
+    ledRed_m2 = server.arg("red2").toInt();
+    ledGreen_m2 = server.arg("green2").toInt();
+    ledBlue_m2 = server.arg("blue2").toInt();
+    ledEffect_m1 = server.arg("effect1");
+    ledEffect_m2 = server.arg("effect2");
     saveSettings = server.arg("chksave");
     String message = "<html>\
       </head>\
@@ -194,10 +264,14 @@ void handleForm() {
     message += "Num LEDs: " + server.arg("leds") + "<br>";
     message += "Brightness: " + server.arg("brightness") + "<br>";
     message += "LED On Time:" + server.arg("ontime") + "<br><br>";
-    message += "<u>LED Color</u>:<br>";
-    message += "Red: " + server.arg("red") + "<br>";  
-    message += "Green: " + server.arg("green") + "<br>";  
-    message += "Blue: " + server.arg("blue") + "<br>";  
+    message += "<b>LED Color/Effect</b>:<br><br>";
+    message += "<table border=\"1\" cellpadding=\"7\">";
+    message += "<tr><td>&nbsp;</td><td><u>Motion 1</u></td><td><u>Motion 2</u></td></tr>";
+    message += "<tr><td>Red:</td><td>" + server.arg("red1") + "</td><td>" + server.arg("red2") + "</td></tr>";  
+    message += "<tr><td>Green:</td><td>" + server.arg("green1") + "</td><td>" +  server.arg("green2") + "</td></tr>";  
+    message += "<tr><td>Blue:</td><td>" + server.arg("blue1") + "</td><td>" + server.arg("blue2") + "</td></tr>"; 
+    message += "<tr><td>Effect:</td><td>" + server.arg("effect1") + "</td><td>" + server.arg("effect2") + "</td></tr>";
+    message += "</table>";
     if (saveSettings == "save") {
       message += "<br>";
       message += "<b>New settings saved as boot defaults.</b> Controller will now reboot.<br>";
@@ -217,18 +291,7 @@ void handleForm() {
   }
 }
 
-void handleNotFound() {
-  String message = "File Not Found or invalid command.\n\n";
-  message += "URI: ";
-  message += server.uri();
-  message += "\nMethod: ";
-  message += (server.method() == HTTP_GET) ? "GET" : "POST";
-  message += "\nArguments: ";
-  message += server.args();
-  message += "\n";
-  server.send(404, "text/plain", message);
-}
-
+// Firmware update handler
 void handleUpdate() {
   String updFirmware = "<html>\
       </head>\
@@ -270,20 +333,28 @@ void updateSettings(bool saveBoot) {
   }
   //Update FastLED with new brightness and ON color settings
   FastLED.setBrightness(ledBrightness);
-  ledColorOn = CRGB(ledRed, ledGreen, ledBlue);
-  toggleLights(true);
+  ledColorOn_m1 = CRGB(ledRed_m1, ledGreen_m1, ledBlue_m1);
+  ledColorOn_m2 = CRGB(ledRed_m2, ledGreen_m2, ledBlue_m2);
+  toggleLights(true, 1);
   delay(2000);
-  toggleLights(false);
+  toggleLights(false, 0);
 }
 
 void updateBootSettings() {
+  // Writes new settings to SPIFFS (new boot defaults)
   char t_pir_count[3];
   char t_led_count[5];
   char t_led_on_time[4];
   char t_led_brightness[4];
-  char t_led_red[4];
-  char t_led_green[4];
-  char t_led_blue[4];
+  char t_led_red_m1[4];
+  char t_led_green_m1[4];
+  char t_led_blue_m1[4];
+  char t_led_red_m2[4];
+  char t_led_green_m2[4];
+  char t_led_blue_m2[4];
+  char t_led_effect[16];
+  char t_led_effect_m2[16];
+  int eff_len = 16;
   #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
     Serial.println("Attempting to update boot settings");
   #endif
@@ -293,9 +364,14 @@ void updateBootSettings() {
   sprintf(t_led_count, "%u", numLEDs);
   sprintf(t_led_on_time, "%u", ledOnTime);
   sprintf(t_led_brightness, "%u", ledBrightness);
-  sprintf(t_led_red, "%u", ledRed);
-  sprintf(t_led_green, "%u", ledGreen);
-  sprintf(t_led_blue, "%u", ledBlue);
+  sprintf(t_led_red_m1, "%u", ledRed_m1);
+  sprintf(t_led_green_m1, "%u", ledGreen_m1);
+  sprintf(t_led_blue_m1, "%u", ledBlue_m1);
+  sprintf(t_led_red_m2, "%u", ledRed_m2);
+  sprintf(t_led_green_m2, "%u", ledGreen_m2);
+  sprintf(t_led_blue_m2, "%u", ledBlue_m2);
+  ledEffect_m1.toCharArray(t_led_effect, eff_len);
+  ledEffect_m2.toCharArray(t_led_effect_m2, eff_len);
 
 #ifdef ARDUINOJSON_VERSION_MAJOR >= 6
     DynamicJsonDocument json(1024);
@@ -308,9 +384,14 @@ void updateBootSettings() {
     json["led_count"] = t_led_count;
     json["led_on_time"] = t_led_on_time;
     json["led_brightness"] = t_led_brightness;
-    json["led_red"] = t_led_red;
-    json["led_green"] = t_led_green;
-    json["led_blue"] = t_led_blue;
+    json["led_red"] = t_led_red_m1;
+    json["led_green"] = t_led_green_m1;
+    json["led_blue"] = t_led_blue_m1;
+    json["led_red_m2"] = t_led_red_m2;
+    json["led_green_m2"] = t_led_green_m2;
+    json["led_blue_m2"] = t_led_blue_m2;
+    json["led_effect"] = t_led_effect;
+    json["led_effect_m2"] = t_led_effect_m2;
 
   File configFile = SPIFFS.open("/config.json", "w");
   if (!configFile) {
@@ -334,6 +415,80 @@ void updateBootSettings() {
   
   ESP.restart();
 }
+
+void handleReset() {
+    String resetMsg = "<HTML>\
+      </head>\
+        <title>LED Controller Reset</title>\
+        <style>\
+          body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }\
+        </style>\
+      </head>\
+      <body>\
+      <H1>Controller Resetting...</H1><br>\
+      <H3>After this process is complete, you must setup your controller again:</H3>\
+      <ul>\
+      <li>Connect a device to the controller's local access point: ESPxxxxxxx</li>\
+      <li>Open a browser and go to: 192.168.4.1</li>\
+      <li>Enter your WiFi information and set other default settings values</li>\
+      <li>Click Save. The controller will reboot and join your WiFi</li>\
+      </ul><br>\
+      Once the above process is complete, you can return to the main settings page by rejoining your WiFi and entering the IP address assigned by your router in a browser.<br><br>\
+      <b>This page will NOT automatically reload or refresh</b>\
+      </body></html>";
+    server.send(200, "text/html", resetMsg);
+    delay(1000);
+    wifiManager.resetSettings();
+    delay(1000);
+    ESP.restart();
+}
+
+void handleRestart() {
+    String restartMsg = "<HTML>\
+      </head>\
+        <title>LED Controller Restart</title>\
+        <style>\
+          body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }\
+        </style>\
+      </head>\
+      <body>\
+      <H1>Controller restarting...</H1><br>\
+      <H3>Please wait</H3><br>\
+      After the controller completes the boot process (lights will flash blue for approx. 2 seconds), you may click the following link to return to the main page:<br><br>\
+      <a href=\"http://";      
+    restartMsg += baseIP;
+    restartMsg += "\">Return to settings</a><br>";
+    restartMsg += "</body></html>";
+    server.send(200, "text/html", restartMsg);
+    delay(1000);
+    ESP.restart();
+}
+
+// Not found or invalid page handler
+void handleNotFound() {
+  String message = "File Not Found or invalid command.\n\n";
+  message += "URI: ";
+  message += server.uri();
+  message += "\nMethod: ";
+  message += (server.method() == HTTP_GET) ? "GET" : "POST";
+  message += "\nArguments: ";
+  message += server.args();
+  message += "\n";
+  server.send(404, "text/plain", message);
+}
+// ==============================
+//  Define Effects
+// ==============================
+//  Increase array size above if adding new
+//  Effect name must not exceed 15 characters and must be a String
+void defineEffects() {
+  Effects[0] = "Solid";
+  Effects[1] = "Chase";
+  Effects[2] = "Chase-Reverse";
+  Effects[3] = "In-Out";
+  Effects[4] = "2-Segment";
+}
+
 // ==================================
 //  Main Setup
 // ==================================
@@ -342,10 +497,16 @@ void setup() {
     Serial.begin(115200);
     Serial.println();
   #endif
-  //clean FS, for testing
+
+  // -----------------------------------------
+  //  Captive Portal and Wifi Onboarding Setup
+  // -----------------------------------------
+  //clean FS, for testing - uncomment next line ONLY if you wish to wipe current FS
   //SPIFFS.format();
 
-  //read configuration from FS json
+  // *******************************
+  // read configuration from FS json
+  // *******************************
   #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
     Serial.println("mounting FS...");
   #endif
@@ -384,6 +545,7 @@ void setup() {
           #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
             Serial.println("\nparsed json");
           #endif
+          // Read values here
           strcpy(pir_count, json["pir_count"]);
           strcpy(led_count, json["led_count"]);
           strcpy(led_on_time, json["led_on_time"]);
@@ -391,7 +553,12 @@ void setup() {
           strcpy(led_red, json["led_red"]);
           strcpy(led_green, json["led_green"]);
           strcpy(led_blue, json["led_blue"]);
-          
+          strcpy(led_red_m2, json["led_red_m2"]|"255");
+          strcpy(led_green_m2, json["led_green_m2"]|"255");
+          strcpy(led_blue_m2, json["led_blue_m2"]|"255");
+          strcpy(led_effect, json["led_effect"]|"Solid");
+          strcpy(led_effect_m2, json["led_effect_m2"]|"Solid");
+         
         } else {
           #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
             Serial.println("failed to load json config");
@@ -498,6 +665,12 @@ void setup() {
     json["led_red"] = led_red;
     json["led_green"] = led_green;
     json["led_blue"] = led_blue;
+    // New values
+    json["led_red_m2"] = led_red;
+    json["led_green_m2"] = led_green;
+    json["led_blue_m2"] = led_blue;
+    json["led_effect"] = "Solid";
+    json["led_effect_m2"] = "Solid";
 
     File configFile = SPIFFS.open("/config.json", "w");
     if (!configFile) {
@@ -516,43 +689,42 @@ void setup() {
     configFile.close();
     //end save
   }
-
   #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
     Serial.println("local ip");
     Serial.println(WiFi.localIP());
   #endif
   baseIP = WiFi.localIP().toString();
-  // SETUP FASTLED
+  // ----------------------------
+  
+
   //Convert config values to local values
   numPIRs = (String(pir_count)).toInt();
   numLEDs = (String(led_count)).toInt();
   ledOnTime = (String(led_on_time)).toInt();
   ledBrightness = (String(led_brightness)).toInt();
-  ledRed = (String(led_red)).toInt();
-  ledGreen = (String(led_green)).toInt();
-  ledBlue = (String(led_blue)).toInt();
-  
+  ledRed_m1 = (String(led_red)).toInt();
+  ledGreen_m1 = (String(led_green)).toInt();
+  ledBlue_m1 = (String(led_blue)).toInt();
+  ledRed_m2 = (String(led_red_m2)).toInt();
+  ledGreen_m2 = (String(led_green_m2)).toInt();
+  ledBlue_m2 = (String(led_blue_m2)).toInt();
+  ledEffect_m1 = String(led_effect);
+  ledEffect_m2 = String(led_effect_m2);
+
+  // SETUP FASTLED  
   FastLED.addLeds<WS2812B, DATA_PIN, GRB>(LEDs, NUM_LEDS_MAX);
   FastLED.setDither(false);
   FastLED.setCorrection(TypicalLEDStrip);
   FastLED.setBrightness(ledBrightness);
-  //fill_solid(LEDs, NUM_LEDS_MAX, CRGB::Blue);
-  fill_solid(LEDs, numLEDs, CRGB::Blue);
-  FastLED.show();
-  #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
-    Serial.println("LEDs Blue - FASTLED ok");
-  #endif
-  delay(2000);
-  fill_solid(LEDs, numLEDs, CRGB::Black);
-  FastLED.show();
-  #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
-    Serial.println("LEDs Reset to off");
-  #endif
-  ledColorOn = CRGB(ledRed, ledGreen, ledBlue);
+  ledColorOn_m1 = CRGB(ledRed_m1, ledGreen_m1, ledBlue_m1);
+  ledColorOn_m2 = CRGB(ledRed_m2, ledGreen_m2, ledBlue_m2);
 
   // Setup motion pins
   pinMode(MOTION_PIN_1, INPUT);
   pinMode(MOTION_PIN_2, INPUT);
+
+  // Define Effects
+  defineEffects();
   
   //-----------------------------
   // Setup OTA Updates
@@ -569,9 +741,9 @@ void setup() {
   });
   ArduinoOTA.begin();
   
-  //==============================
+  //------------------------------
   // Setup handlers for web calls
-  //==============================
+  //------------------------------
   server.on("/", handleRoot);
 
   server.on("/postform/", handleForm);
@@ -579,64 +751,39 @@ void setup() {
   server.onNotFound(handleNotFound);
 
   server.on("/update", handleUpdate);
-  httpUpdater.setup(&server, "/update2");
 
-  server.on("/restart",[](){
-    String restartMsg = "<HTML>\
-      </head>\
-        <title>LED Controller Restart</title>\
-        <style>\
-          body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }\
-        </style>\
-      </head>\
-      <body>\
-      <H1>Controller restarting...</H1><br>\
-      <H3>Please wait</H3><br>\
-      After the controller completes the boot process (lights will flash blue for approx. 2 seconds), you may click the following link to return to the main page:<br><br>\
-      <a href=\"http://";      
-    restartMsg += baseIP;
-    restartMsg += "\">Return to settings</a><br>";
-    restartMsg += "</body></html>";
-    server.send(200, "text/html", restartMsg);
-    delay(1000);
-    ESP.restart();
-  });
-  server.on("/reset",[](){
-    String resetMsg = "<HTML>\
-      </head>\
-        <title>LED Controller Reset</title>\
-        <style>\
-          body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }\
-        </style>\
-      </head>\
-      <body>\
-      <H1>Controller Resetting...</H1><br>\
-      <H3>After this process is complete, you must setup your controller again:</H3>\
-      <ul>\
-      <li>Connect a device to the controller's local access point: ESPxxxxxxx</li>\
-      <li>Open a browser and go to: 192.168.4.1</li>\
-      <li>Enter your WiFi information and set other default settings values</li>\
-      <li>Click Save. The controller will reboot and join your WiFi</li>\
-      </ul><br>\
-      Once the above process is complete, you can return to the main settings page by rejoining your WiFi and entering the IP address assigned by your router in a browser.<br><br>\
-      <b>This page will NOT automatically reload or refresh</b>\
-      </body></html>";
-    server.send(200, "text/html", resetMsg);
-    delay(1000);
-    wifiManager.resetSettings();
-    delay(1000);
-    ESP.restart();
-  });
+  server.on("/restart", handleRestart);
+
+  server.on("/reset", handleReset);
+
   server.on("/otaupdate",[]() {
+    //Called directly from browser address (//ip_address/otaupdate) to put controller in ota mode for uploadling from Arduino IDE
     server.send(200, "text/html", "<h1>Ready for upload...<h1><h3>Start upload from IDE now</h3>");
     ota_flag = true;
     ota_time = ota_time_window;
     ota_time_elapsed = 0;
   });
+  //OTA Update Handler
+  httpUpdater.setup(&server, "/update2");
   httpUpdater.setup(&server);
   server.begin();
   #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
     Serial.println("Setup complete - starting main loop");
+  #endif
+
+  // ---------------------------------------------------------
+  // Flash LEDs blue for 2 seconds to indicate successful boot 
+  // ---------------------------------------------------------
+  fill_solid(LEDs, numLEDs, CRGB::Blue);
+  FastLED.show();
+  #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+    Serial.println("LEDs Blue - FASTLED ok");
+  #endif
+  delay(2000);
+  fill_solid(LEDs, numLEDs, CRGB::Black);
+  FastLED.show();
+  #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+    Serial.println("LEDs Reset to off");
   #endif
 }
 
@@ -660,16 +807,24 @@ void loop() {
   unsigned long curTime = millis();
 
   if (numPIRs > 1) {
-    if ((digitalRead(MOTION_PIN_1) == HIGH) || (digitalRead(MOTION_PIN_2) == HIGH)) {
+    if (digitalRead(MOTION_PIN_1) == HIGH) {
       if (!lightsOn) {
-        toggleLights(true); 
+        toggleLights(true, 1); 
         #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
-          Serial.println("Lights on");
+          Serial.println("Motion 1 Lights on");
+        #endif 
+      }
+      onTime = millis();    
+    } else if  (digitalRead(MOTION_PIN_2) == HIGH) {
+      if (!lightsOn) {
+        toggleLights(true, 2);
+        #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+          Serial.println("Motion 2 Lights on");
         #endif 
       }
       onTime = millis();    
     } else if ((digitalRead(MOTION_PIN_1) == LOW) && (digitalRead(MOTION_PIN_2) == LOW) && (lightsOn) && ((millis() - onTime) > (ledOnTime * 1000))) {
-      toggleLights(false);
+      toggleLights(false, 0);
       #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
         Serial.println("Lights off");
       #endif
@@ -678,25 +833,103 @@ void loop() {
   } else {
     if ((digitalRead(MOTION_PIN_1) == HIGH)) {
       if (!lightsOn) {
-        toggleLights(true);
+        toggleLights(true, 1);
       }
       onTime = millis();
     } else if ((digitalRead(MOTION_PIN_1) == LOW) && (lightsOn) && ((millis() - onTime) > (ledOnTime * 1000))) {
-      toggleLights(false);
+      toggleLights(false, 0);
     }
   }
 }
 // =========================
 //  Other functions
 // =========================
-void toggleLights(bool turnOn) {
+void toggleLights(bool turnOn, byte whichMotion) {
   if (turnOn) {
-    fill_solid(LEDs, numLEDs, ledColorOn);
     lightsOn = true;
-    FastLED.show();
+    if (whichMotion == 1) {
+      if (ledEffect_m1 == "Solid") {
+        effectSolid(ledColorOn_m1);
+      } else if (ledEffect_m1 == "Chase") {
+        effectChase(ledColorOn_m1);
+      } else if (ledEffect_m1 == "Chase-Reverse") {
+        effectChaseReverse(ledColorOn_m1);
+      } else if (ledEffect_m1 == "In-Out") {
+        effectInOut(ledColorOn_m1);
+      } else if (ledEffect_m1 == "2-Segment") {
+        effect2Segment(ledColorOn_m1);
+      }
+    } else {
+      if (ledEffect_m2 == "Solid") {
+        effectSolid(ledColorOn_m2);
+      } else if (ledEffect_m2 == "Chase") {
+        effectChase(ledColorOn_m2);
+      } else if (ledEffect_m2 == "Chase-Reverse") {
+        effectChaseReverse(ledColorOn_m2);
+      } else if (ledEffect_m2 == "In-Out") {
+        effectInOut(ledColorOn_m2);
+      } else if (ledEffect_m2 == "2-Segment") {
+        effect2Segment(ledColorOn_m2);
+      }
+      
+    }
   } else {
     fill_solid(LEDs, numLEDs, ledColorOff);   
     lightsOn = false;
     FastLED.show();
+  }
+}
+// =====================
+//  Effects
+// =====================
+void effectSolid(CRGB ledColor) {
+  fill_solid(LEDs, numLEDs, ledColor);
+  FastLED.show();
+}
+
+void effectChase(CRGB ledColor) {
+  for (int i=0; i < (numLEDs); i++) {
+    LEDs[i] = ledColor;
+    FastLED.show();
+    delay(25);
+  }
+}
+
+void effectChaseReverse(CRGB ledColor) {
+  for (int r=(numLEDs-1); r>=0; r--) {
+    LEDs[r] = ledColor;
+    FastLED.show();
+    delay(25);
+  }
+}
+
+void effect2Segment(CRGB ledColor) {
+  for (int i=0; i < (numLEDs); i++) {
+    LEDs[i] = ledColorOn_m1;
+    LEDs[(numLEDs - 1) - i] = ledColorOn_m2;
+    FastLED.show();
+    delay(25);
+  }  
+}
+
+void effectInOut(CRGB ledColor) {
+  bool isOdd;
+  int startPixel = numLEDs/2;
+  int mod = numLEDs % 2;
+  int upCounter;
+  //adjust for 0 based array
+  startPixel = startPixel - 1;
+  if (mod != 0) {
+    startPixel = startPixel + 1;
+    upCounter = startPixel;
+  } else {
+    upCounter = startPixel + 1;
+  }
+  for (int i=(startPixel); i >= 0; i--) {
+     LEDs[i] = ledColor;
+     LEDs[upCounter] = ledColor;
+     upCounter = upCounter + 1;
+     FastLED.show();
+     delay(25);
   }
 }
