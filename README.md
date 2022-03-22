@@ -6,3 +6,6 @@ This repository contains the code for an ESP8266 controller (D1 Mini or NodeMCU)
 
 For controller build instructions, please see either the [YouTube video](https://youtu.be/b4s_VEtVWY4) or the related [Blog article](https://resinchemtech.blogspot.com/2021/12/standalone-led-controller.html)
 For complete installation and configuration info, please see the [wiki](https://github.com/Resinchem/standalone-led-controller/wiki)
+
+>*If you found this project helpful, would like to say thanks or help support future development:*<br>
+>[![buy_me_a_coffee_sm](https://user-images.githubusercontent.com/55962781/159586675-7476e996-a990-4918-8825-aa6812f3ea28.jpg)](https://www.buymeacoffee.com/resinchemtech)
