@@ -2,13 +2,10 @@
  * Standalone LED Controller with Motion Detection
  * Includes captive portal and OTA Updates
  * This provides standalone motion-activated control for WS2812b LED strips
- * Version: 0.45
- * Last Updated: 12/14/2021
+ * Version: 0.46
+ * Last Updated: 2/14/2024
  * ResinChem Tech
- * 0.45 notes
- *   - Add separate colors for each motion detector
- *   - Add a few basic effects
- *   - General code cleanup and documentation
+ * See Github release for 0.46 notes
  */
 #include <FS.h>                   
 #include <WiFiManager.h>          //https://github.com/tzapu/WiFiManager
@@ -25,7 +22,7 @@
 #ifdef ESP32
   #include <SPIFFS.h>
 #endif
-#define VERSION "v0.45 (ESP8266)"
+#define VERSION "v0.46 (ESP8266)"
 
 // ================================
 //  User Defined values and options
@@ -39,7 +36,7 @@ uint16_t ota_time_window = 20000;        // time to start file upload when ota_f
 #define MOTION_PIN_1 D5
 #define MOTION_PIN_2 D6
 #define NUM_LEDS_MAX 600
-#define SERIAL_DEBUG 1                   // Enable(1) or disable (0) serial montior output - disable for compiled .bin
+#define SERIAL_DEBUG 0                   // Enable(1) or disable (0) serial montior output - disable for compiled .bin
 // ================================
 
 // ===============================
@@ -55,11 +52,23 @@ uint16_t ota_time_window = 20000;        // time to start file upload when ota_f
 int numberOfEffects = 5;
 String Effects[5]; 
 
+// ===========================
+//  Device and Global Vars
+// ===========================
+String deviceName = "MotionLED";
+String wifiHostName = "MotionLED";
+String otaHostName = "MotionLED";
+
+bool bTesting = false;
 uint16_t ota_time_elapsed = 0;           // Counter when OTA active
 bool ota_flag = true;
 bool lightsOn = false;
 unsigned long onTime = 0;
 
+//Chars for JSON/Config
+char device_name[25];
+char wifi_hostname[25];
+char ota_hostname[25];
 char pir_count[3];
 char led_count[5];
 char led_on_time[4];
@@ -122,13 +131,14 @@ CRGB ledColorOff = CRGB::Black;
 void handleRoot() {
   String mainPage = "<html>\
   <head>\
-    <title>LED Controller</title>\
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\
+    <title>VAR_DEVICE_NAME Controller</title>\
     <style>\
       body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }\
     </style>\
   </head>\
   <body>\
-    <h1>LED Controller Settings</h1><br>\
+    <h1>VAR_DEVICE_NAME Controller Settings</h1><br>\
     Changes made here will be used <b><i>until the controller is restarted</i></b>, unless the box to save the settings as new boot defaults is checked.<br><br>\
     To test settings, leave the box unchecked and click 'Update'. Once you have settings you'd like to keep, check the box and click 'Update' to write the settings as the new boot defaults.<br><br>\
     If you need to change wifi settings, you must use the 'Reset All' command.<br><br>\
@@ -227,6 +237,7 @@ void handleRoot() {
     Current version: VAR_CURRRENT_VER\
   </body>\
 </html>";
+  mainPage.replace("VAR_DEVICE_NAME", deviceName);
   mainPage.replace("VAR_CURRRENT_VER", VERSION);
   server.send(200, "text/html", mainPage);
 }
@@ -252,7 +263,8 @@ void handleForm() {
     saveSettings = server.arg("chksave");
     String message = "<html>\
       </head>\
-        <title>LED Controller Settings</title>\
+        <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\
+        <title>VAR_DEVICE_NAME Controller Settings</title>\
         <style>\
           body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }\
         </style>\
@@ -281,6 +293,7 @@ void handleForm() {
     message += baseIP;
     message += "\">Return to settings</a><br>";
     message += "</body></html>";
+    message.replace("VAR_DEVICE_NAME", deviceName);
     server.send(200, "text/html", message);
     delay(1000);
     if (saveSettings == "save") {
@@ -295,7 +308,8 @@ void handleForm() {
 void handleUpdate() {
   String updFirmware = "<html>\
       </head>\
-        <title>LED Controller Settings</title>\
+        <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\
+        <title>VAR_DEVICE_NAME Controller Settings</title>\
         <style>\
           body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }\
         </style>\
@@ -322,6 +336,7 @@ void handleUpdate() {
   updFirmware += baseIP;
   updFirmware += "\">Return to settings</a><br>";
   updFirmware += "</body></html>";
+  updFirmware.replace("VAR_DEVICE_NAME", deviceName);
   server.send(200, "text/html", updFirmware); 
 }
 
@@ -342,6 +357,7 @@ void updateSettings(bool saveBoot) {
 
 void updateBootSettings() {
   // Writes new settings to SPIFFS (new boot defaults)
+  char t_device_name[25];
   char t_pir_count[3];
   char t_led_count[5];
   char t_led_on_time[4];
@@ -355,11 +371,13 @@ void updateBootSettings() {
   char t_led_effect[16];
   char t_led_effect_m2[16];
   int eff_len = 16;
+  int dev_name_len = 25;
   #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
     Serial.println("Attempting to update boot settings");
   #endif
 
   //Convert values into char arrays
+  deviceName.toCharArray(t_device_name, dev_name_len);
   sprintf(t_pir_count, "%u", numPIRs);
   sprintf(t_led_count, "%u", numLEDs);
   sprintf(t_led_on_time, "%u", ledOnTime);
@@ -373,13 +391,8 @@ void updateBootSettings() {
   ledEffect_m1.toCharArray(t_led_effect, eff_len);
   ledEffect_m2.toCharArray(t_led_effect_m2, eff_len);
 
-#ifdef ARDUINOJSON_VERSION_MAJOR >= 6
     DynamicJsonDocument json(1024);
-#else
-    DynamicJsonBuffer jsonBuffer;
-    JsonObject& json = jsonBuffer.createObject();
-#endif
-
+    json["device_name"] = t_device_name;
     json["pir_count"] = t_pir_count;
     json["led_count"] = t_led_count;
     json["led_on_time"] = t_led_on_time;
@@ -393,33 +406,36 @@ void updateBootSettings() {
     json["led_effect"] = t_led_effect;
     json["led_effect_m2"] = t_led_effect_m2;
 
-  File configFile = SPIFFS.open("/config.json", "w");
-  if (!configFile) {
-    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
-      Serial.println("failed to open config file for writing");
-    #endif
-  }
-
-#ifdef ARDUINOJSON_VERSION_MAJOR >= 6
-    serializeJson(json, Serial);
-    serializeJson(json, configFile);
-#else
-    json.printTo(Serial);
-    json.printTo(configFile);
-#endif
-    configFile.close();
-    //end save
-  #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
-    Serial.println("Boot settings saved. Rebooting controller.");
-  #endif
-  
+    if (SPIFFS.begin()) {
+      File configFile = SPIFFS.open("/config.json", "w");
+      if (!configFile) {
+        #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+          Serial.println("failed to open config file for writing");
+        #endif
+      }
+        #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+          serializeJson(json, Serial);
+        #endif
+        serializeJson(json, configFile);
+        configFile.close();
+        //end save
+      #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+        Serial.println("Boot settings saved. Rebooting controller.");
+      #endif
+    } else {
+      #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+        Serial.println("failed to mount FS");
+      #endif
+    }
+  SPIFFS.end();
   ESP.restart();
 }
 
 void handleReset() {
     String resetMsg = "<HTML>\
       </head>\
-        <title>LED Controller Reset</title>\
+        <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\
+        <title>VAR_DEVICE_NAME Controller Reset</title>\
         <style>\
           body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }\
         </style>\
@@ -428,17 +444,19 @@ void handleReset() {
       <H1>Controller Resetting...</H1><br>\
       <H3>After this process is complete, you must setup your controller again:</H3>\
       <ul>\
-      <li>Connect a device to the controller's local access point: ESPxxxxxxx</li>\
+      <li>Connect a device to the controller's local access point: MotionLED_AP</li>\
       <li>Open a browser and go to: 192.168.4.1</li>\
-      <li>Enter your WiFi information and set other default settings values</li>\
-      <li>Click Save. The controller will reboot and join your WiFi</li>\
+      <li>Enter your WiFi information, device name and other default values</li>\
+      <li>Click Save. The controller will reboot and rejoin your WiFi</li>\
       </ul><br>\
       Once the above process is complete, you can return to the main settings page by rejoining your WiFi and entering the IP address assigned by your router in a browser.<br><br>\
       <b>This page will NOT automatically reload or refresh</b>\
       </body></html>";
+    resetMsg.replace("VAR_DEVICE_NAME", deviceName);
     server.send(200, "text/html", resetMsg);
     delay(1000);
     wifiManager.resetSettings();
+    SPIFFS.format();
     delay(1000);
     ESP.restart();
 }
@@ -446,7 +464,8 @@ void handleReset() {
 void handleRestart() {
     String restartMsg = "<HTML>\
       </head>\
-        <title>LED Controller Restart</title>\
+        <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\
+        <title>VAR_DEVICE_NAME Controller Restart</title>\
         <style>\
           body { background-color: #cccccc; font-family: Arial, Helvetica, Sans-Serif; Color: #000088; }\
         </style>\
@@ -454,11 +473,12 @@ void handleRestart() {
       <body>\
       <H1>Controller restarting...</H1><br>\
       <H3>Please wait</H3><br>\
-      After the controller completes the boot process (lights will flash blue for approx. 2 seconds), you may click the following link to return to the main page:<br><br>\
+      After the controller completes the boot process (lights will flash blue followed by red/green for approximately 2-3 seconds each), you may click the following link to return to the main page:<br><br>\
       <a href=\"http://";      
     restartMsg += baseIP;
     restartMsg += "\">Return to settings</a><br>";
     restartMsg += "</body></html>";
+    restartMsg.replace("VAR_DEVICE_NAME", deviceName);
     server.send(200, "text/html", restartMsg);
     delay(1000);
     ESP.restart();
@@ -493,6 +513,7 @@ void defineEffects() {
 //  Main Setup
 // ==================================
 void setup() {
+  bool spiffsOpen = false;
   #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
     Serial.begin(115200);
     Serial.println();
@@ -515,6 +536,7 @@ void setup() {
     #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
       Serial.println("mounted file system");
     #endif
+    spiffsOpen = true;
     if (SPIFFS.exists("/config.json")) {
       //file exists, reading and loading
       #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
@@ -531,17 +553,12 @@ void setup() {
 
         configFile.readBytes(buf.get(), size);
 
-#ifdef ARDUINOJSON_VERSION_MAJOR >= 6
         DynamicJsonDocument json(1024);
         auto deserializeError = deserializeJson(json, buf.get());
-        serializeJson(json, Serial);
+        #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+          serializeJson(json, Serial);
+        #endif
         if ( ! deserializeError ) {
-#else
-        DynamicJsonBuffer jsonBuffer;
-        JsonObject& json = jsonBuffer.parseObject(buf.get());
-        json.printTo(Serial);
-        if (json.success()) {
-#endif
           #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
             Serial.println("\nparsed json");
           #endif
@@ -558,7 +575,7 @@ void setup() {
           strcpy(led_blue_m2, json["led_blue_m2"]|"255");
           strcpy(led_effect, json["led_effect"]|"Solid");
           strcpy(led_effect_m2, json["led_effect_m2"]|"Solid");
-         
+          strcpy(device_name, json["device_name"]|"MotionLED");
         } else {
           #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
             Serial.println("failed to load json config");
@@ -573,10 +590,13 @@ void setup() {
     #endif
   }
   //end read
-
+  
+  WiFi.mode(WIFI_STA);
   // The extra parameters to be configured (can be either global or just in the setup)
   // After connecting, parameter.getValue() will get you the configured value
   // id/name placeholder/prompt default length
+  WiFiManagerParameter custom_text("<p>Each controller must have a unique name. a-z, A-Z, 0-9, underscore and hyphen only.  No spaces, 24 chars max.  See the wiki for more information.</p>");
+  WiFiManagerParameter custom_dev_name("devName", "Device Name", device_name, 24, "Unique Device Name (24 chars max)");
   WiFiManagerParameter custom_pir_num("pirCount", "Number of PIRs", pir_count, 3, "Number of Motion PIRs (1 or 2)");
   WiFiManagerParameter custom_led_num("ledCount", "Number of LEDs", led_count, 5, "Number of LEDs (max 600)");
   WiFiManagerParameter custom_led_time("ledTime", "LED on time", led_on_time, 4, "LED on time (seconds)");
@@ -592,6 +612,8 @@ void setup() {
   //wifiManager.setSTAStaticIPConfig(IPAddress(10, 0, 1, 99), IPAddress(10, 0, 1, 1), IPAddress(255, 255, 255, 0));
 
   //add all your parameters here
+  wifiManager.addParameter(&custom_text);
+  wifiManager.addParameter(&custom_dev_name);
   wifiManager.addParameter(&custom_pir_num);
   wifiManager.addParameter(&custom_led_num);
   wifiManager.addParameter(&custom_led_time);
@@ -613,7 +635,7 @@ void setup() {
   //here  "MyApName".  If not supplied, will use ESP + last 7 digits of MAC
   //and goes into a blocking loop awaiting configuration. If a password
   //is desired for the AP, add it after the AP name (e.g. autoConnect("MyApName", "12345678")
-  if (!wifiManager.autoConnect()) {
+  if (!wifiManager.autoConnect("MotionLED_AP")) {
     #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
       Serial.println("failed to connect and hit timeout");
     #endif
@@ -622,13 +644,23 @@ void setup() {
     ESP.restart();
     delay(5000);
   }
+  if (shouldSaveConfig) {
+    strcpy(device_name, custom_dev_name.getValue());
+  }
 
+  //Set Host Names 
+  deviceName = String(device_name);
+  wifiHostName = deviceName;
+  otaHostName = deviceName + "OTA";
+  
   //if you get here you have connected to the WiFi
   WiFi.setSleepMode(WIFI_NONE_SLEEP);
+  WiFi.hostname(wifiHostName.c_str());
   #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
     Serial.println("connected to your wifi...yay!");
   #endif
   //read updated parameters
+  strcpy(device_name, custom_dev_name.getValue());
   strcpy(pir_count, custom_pir_num.getValue());
   strcpy(led_count, custom_led_num.getValue());
   strcpy(led_on_time, custom_led_time.getValue());
@@ -639,6 +671,7 @@ void setup() {
 
   #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
     Serial.println("The values in the file are: ");
+    Serial.println("\tdevice_name : " + String(device_name));
     Serial.println("\tpir_count : " + String(pir_count));
     Serial.println("\tled_count : " + String(led_count));
     Serial.println("\tdata_on_time : " + String(led_on_time));
@@ -652,12 +685,9 @@ void setup() {
     #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
       Serial.println("saving config");
     #endif
-#ifdef ARDUINOJSON_VERSION_MAJOR >= 6
+
     DynamicJsonDocument json(1024);
-#else
-    DynamicJsonBuffer jsonBuffer;
-    JsonObject& json = jsonBuffer.createObject();
-#endif
+    json["device_name"] = device_name;
     json["pir_count"] = pir_count;
     json["led_count"] = led_count;
     json["led_on_time"] = led_on_time;
@@ -672,21 +702,25 @@ void setup() {
     json["led_effect"] = "Solid";
     json["led_effect_m2"] = "Solid";
 
+    //Provide defaults for first time values that aren't part of onboarding (Issue #2)
+    ledEffect_m1.toCharArray(led_effect, 16);
+    ledEffect_m2.toCharArray(led_effect_m2, 16);
+    strcpy(led_red_m2, led_red);
+    strcpy(led_green_m2, led_green);
+    strcpy(led_blue_m2, led_blue);
+    
     File configFile = SPIFFS.open("/config.json", "w");
     if (!configFile) {
       #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
         Serial.println("failed to open config file for writing");
       #endif
     }
-
-#ifdef ARDUINOJSON_VERSION_MAJOR >= 6
-    serializeJson(json, Serial);
+    #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
+      serializeJson(json, Serial);
+    #endif
     serializeJson(json, configFile);
-#else
-    json.printTo(Serial);
-    json.printTo(configFile);
-#endif
     configFile.close();
+    SPIFFS.end();
     //end save
   }
   #if defined(SERIAL_DEBUG) && (SERIAL_DEBUG == 1)
@@ -729,7 +763,7 @@ void setup() {
   //-----------------------------
   // Setup OTA Updates
   //-----------------------------
-  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  ArduinoOTA.setHostname(otaHostName.c_str());
   ArduinoOTA.onStart([]() {
     String type;
     if (ArduinoOTA.getCommand() == U_FLASH) {
@@ -793,12 +827,14 @@ void setup() {
 void loop() {
   //Handle OTA updates when OTA flag set via HTML call to http://ip_address/otaupdate
   if (ota_flag) {
+    showOTA();
     uint16_t ota_time_start = millis();
     while (ota_time_elapsed < ota_time) {
       ArduinoOTA.handle();  
       ota_time_elapsed = millis()-ota_time_start;   
       delay(10); 
     }
+    allLEDsOff();
     ota_flag = false;
   }
   //Handle any web calls
@@ -806,7 +842,9 @@ void loop() {
   //Main loop
   unsigned long curTime = millis();
 
-  if (numPIRs > 1) {
+  if ((bTesting) && (!lightsOn)) {
+    toggleLights(true, 1);
+  } else if (numPIRs > 1) {
     if (digitalRead(MOTION_PIN_1) == HIGH) {
       if (!lightsOn) {
         toggleLights(true, 1); 
@@ -858,6 +896,9 @@ void toggleLights(bool turnOn, byte whichMotion) {
         effectInOut(ledColorOn_m1);
       } else if (ledEffect_m1 == "2-Segment") {
         effect2Segment(ledColorOn_m1);
+      } else {
+        //Default to solid (Issue #2)
+        effectSolid(ledColorOn_m1);
       }
     } else {
       if (ledEffect_m2 == "Solid") {
@@ -870,6 +911,9 @@ void toggleLights(bool turnOn, byte whichMotion) {
         effectInOut(ledColorOn_m2);
       } else if (ledEffect_m2 == "2-Segment") {
         effect2Segment(ledColorOn_m2);
+      } else {
+        //Default to solid (Issue #2)
+        effectSolid(ledColorOn_m2);
       }
       
     }
@@ -932,4 +976,22 @@ void effectInOut(CRGB ledColor) {
      FastLED.show();
      delay(25);
   }
+}
+
+void showOTA() {
+  fill_solid(LEDs, numLEDs, CRGB::Black);
+  //Alternate LED colors using red and green
+  FastLED.setBrightness(ledBrightness);
+  for (int i=0; i < (numLEDs-1); i = i + 2) {
+    LEDs[i] = CRGB::Red;
+    LEDs[i+1] = CRGB::Green;
+  }
+  FastLED.show();  
+}
+
+void allLEDsOff() {
+  fill_solid(LEDs, numLEDs, ledColorOff);   
+  lightsOn = false;
+  FastLED.show();
+
 }
